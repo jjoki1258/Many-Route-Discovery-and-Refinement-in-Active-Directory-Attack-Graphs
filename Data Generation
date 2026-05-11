@@ -1,0 +1,331 @@
+# ============================================================
+# BloodHound-like AD Attack Graph Synthetic Generator (Colab)
+# (A) 엣지 폭증 방지: "전체쌍 이중루프" 제거 + 샘플링/상한 기반 생성
+# (B) OU -> (User/Computer) Contains 엣지 추가 (구조 현실성 강화)
+# r500 / r1000 / r2000 한 번에 생성 + pkl/csv/json/summary 저장
+# 저장 경로: /content/drive/MyDrive/Colab Notebooks/26.2.26  ga test2
+# ============================================================
+
+# ----------------------------
+# 0) (Colab) Google Drive 마운트
+# ----------------------------
+from google.colab import drive
+drive.mount('/content/drive')
+
+# ----------------------------
+# 1) 라이브러리 임포트
+# ----------------------------
+import os                                      # 폴더/파일 생성 및 경로 처리
+import json                                    # JSON 저장용
+import random                                  # 랜덤 샘플링용
+import pickle                                  # NetworkX 그래프 저장
+import numpy as np                             # 포아송/샘플링 등 분포 기반 생성
+from collections import Counter                # 분포 요약용
+import pandas as pd                            # CSV 저장/분석용
+import networkx as nx                          # 그래프 생성/처리용
+
+# ----------------------------
+# 2) 전역 설정
+# ----------------------------
+SEED = 42                                      # 재현성 시드
+random.seed(SEED)                               # 파이썬 랜덤 고정
+np.random.seed(SEED)                            # 넘파이 랜덤 고정
+
+DOMAIN_NAME = "GHOST.CORP"                     # 테스트 도메인
+BASE_SAVE_DIR = "/content/drive/MyDrive/Colab Notebooks/26.2.26  ga test2"  # 사용자 지정 저장 위치
+OUTPUT_BASE = os.path.join(BASE_SAVE_DIR, "bh_r_datasets")                  # 데이터셋 루트 폴더
+os.makedirs(OUTPUT_BASE, exist_ok=True)         # 루트 폴더 생성
+
+R_LEVELS = [500, 1000, 2000]                    # r500/r1000/r2000
+
+# ----------------------------
+# 3) 노드 스케일 비율 (Computer 수 기준)
+# ----------------------------
+USER_PER_COMPUTER = 4.0                         # User 수 = Computer 수 * 4
+GROUP_PER_USER = 0.4                            # Group 수 = User 수 * 0.4
+OU_PER_COMPUTER = 1/25                          # OU 수 = Computer 수 / 25
+GPO_PER_COMPUTER = 1/50                         # GPO 수 = Computer 수 / 50
+
+# ----------------------------
+# 4) (A) 엣지 폭증 방지용 "현실적 분포" 파라미터
+#    기존 코드는 (User×Group), (User×Computer) 전체쌍을 돌면서 확률로 연결해
+#    r2000에서 엣지가 기하급수적으로 커질 수 있었음.
+#    여기서는 "각 노드가 연결하는 개수"를 분포로 샘플링하여 O(N)~O(N log N)으로 제한.
+# ----------------------------
+
+# 4-1) User/Computer -> Group (MemberOf) : 평균 가입 그룹 수 (현실적 상한 포함)
+AVG_GROUPS_PER_USER = 5                         # 사용자 1명이 평균 가입하는 그룹 수
+MAX_GROUPS_PER_USER = 25                        # 사용자 1명당 가입 그룹 상한
+
+AVG_GROUPS_PER_COMPUTER = 2                     # 컴퓨터 1대가 평균 속하는 그룹 수
+MAX_GROUPS_PER_COMPUTER = 10                    # 컴퓨터 1대당 상한
+
+# 4-2) Group nesting (Group -> Group MemberOf) : 그룹 중첩 평균/상한
+AVG_PARENTS_PER_GROUP = 1                       # 그룹당 상위 그룹 평균 개수
+MAX_PARENTS_PER_GROUP = 3                       # 그룹당 상한
+
+# 4-3) AdminTo (User/Group -> Computer) : 관리자 권한 부여 평균/상한
+AVG_ADMINTO_COMPUTERS_PER_USER = 1              # 유저 1명이 AdminTo 갖는 컴퓨터 평균 개수
+MAX_ADMINTO_COMPUTERS_PER_USER = 10             # 유저 1명 상한
+
+AVG_ADMINTO_COMPUTERS_PER_GROUP = 3             # 그룹 1개가 AdminTo 갖는 컴퓨터 평균 개수
+MAX_ADMINTO_COMPUTERS_PER_GROUP = 30            # 그룹 1개 상한
+
+# 4-4) HasSession (User -> Computer) : 세션 보유 유저 비율 + 유저당 세션 개수 평균/상한
+P_USER_HAS_ANY_SESSION = 0.30                   # 세션이 "하나라도" 있을 유저 비율
+AVG_SESSIONS_PER_SESSION_USER = 1.5             # 세션 유저 1명당 평균 세션 수
+MAX_SESSIONS_PER_SESSION_USER = 6               # 상한
+
+# 4-5) WriteOwner (principal -> Group) : ACL 느낌 권한 평균/상한
+AVG_WRITEOWNER_PER_PRINCIPAL = 1                # 주체(유저/그룹) 1개당 평균 WriteOwner 대상 그룹 수
+MAX_WRITEOWNER_PER_PRINCIPAL = 8                # 상한
+
+# 4-6) DCSync 느낌 (principal -> Domain) : 비교적 희소하게 유지
+P_GETCHANGES = 0.02
+P_GETCHANGESALL = 0.01
+
+# 4-7) OU -> GPO (GpLink) : OU당 링크되는 GPO 평균/상한
+AVG_GPOS_PER_OU = 2                              # OU 1개당 평균 연결 GPO 수
+MAX_GPOS_PER_OU = 8                              # 상한
+
+# ----------------------------
+# 5) 유틸 함수들
+# ----------------------------
+def ensure_dir(path: str) -> None:
+    """폴더가 없으면 생성"""
+    os.makedirs(path, exist_ok=True)
+
+def poisson_bounded(lam: float, max_k: int) -> int:
+    """
+    포아송 분포로 정수 샘플링하되, [0, max_k] 범위로 자름.
+    - lam이 커도 상한으로 폭증 방지
+    """
+    if lam <= 0:
+        return 0
+    k = int(np.random.poisson(lam))
+    if k < 0:
+        k = 0
+    if k > max_k:
+        k = max_k
+    return k
+
+def sample_unique(items, k: int):
+    """items에서 중복 없이 k개 샘플(가능한 범위로 자동 조정)"""
+    if k <= 0:
+        return []
+    if k >= len(items):
+        return list(items)
+    return random.sample(items, k)
+
+# ----------------------------
+# 6) (A)+(B) 적용한 BloodHound-like 합성 그래프 생성
+# ----------------------------
+def generate_bloodhound_like_graph(num_computers: int) -> nx.DiGraph:
+    """
+    BloodHound 스타일 AD 공격 그래프 합성 생성
+    - 노드 타입: Domain, OU, GPO, User, Computer, Group
+    - 관계 타입: MemberOf, AdminTo, HasSession, WriteOwner,
+                GetChanges, GetChangesAll, GpLink, Contains
+    - (A) 엣지 폭증 방지: 전수(이중루프) 대신 분포 기반 샘플링
+    - (B) OU -> (User/Computer) Contains 엣지 추가
+    """
+    G = nx.DiGraph()
+
+    # 6-1) 노드 수 결정
+    num_users = int(num_computers * USER_PER_COMPUTER)
+    num_groups = max(10, int(num_users * GROUP_PER_USER))
+    num_ous = max(10, int(num_computers * OU_PER_COMPUTER))
+    if num_ous % 2 == 1:
+        num_ous += 1
+    num_gpos = max(10, int(num_computers * GPO_PER_COMPUTER))
+
+    # 6-2) Domain 노드
+    domain = f"DOMAIN@{DOMAIN_NAME}"
+    G.add_node(domain, type="Domain", name=DOMAIN_NAME)
+
+    # 6-3) OU 노드 + Domain -> OU Contains
+    ou_ids = []
+    for i in range(num_ous):
+        ou = f"OU{i}@{DOMAIN_NAME}"
+        ou_ids.append(ou)
+        G.add_node(ou, type="OU", name=ou)
+        G.add_edge(domain, ou, relation="Contains")
+
+    # 6-4) GPO 노드 + Domain -> GPO Contains
+    gpo_ids = []
+    for i in range(num_gpos):
+        gpo = f"GPO{i}@{DOMAIN_NAME}"
+        gpo_ids.append(gpo)
+        G.add_node(gpo, type="GPO", name=gpo)
+        G.add_edge(domain, gpo, relation="Contains")
+
+    # 6-5) Group 노드 + Domain Admins 추가
+    group_ids = []
+    for i in range(num_groups):
+        g = f"GROUP{i}@{DOMAIN_NAME}"
+        group_ids.append(g)
+        G.add_node(g, type="Group", name=g)
+
+    domain_admins = f"DOMAIN ADMINS@{DOMAIN_NAME}"
+    G.add_node(domain_admins, type="Group", name=domain_admins)
+    group_ids.append(domain_admins)
+
+    # 6-6) User 노드 생성 + (B) OU -> User Contains 추가
+    user_ids = []
+    for i in range(num_users):
+        u = f"USER{i}@{DOMAIN_NAME}"
+        user_ids.append(u)
+        home_ou = random.choice(ou_ids)
+        G.add_node(u, type="User", name=u, homeOU=home_ou)
+        G.add_edge(home_ou, u, relation="Contains")   # (B) OU -> User
+
+    # 6-7) Computer 노드 생성 + (B) OU -> Computer Contains 추가
+    computer_ids = []
+    for i in range(num_computers):
+        c = f"PC{i}@{DOMAIN_NAME}"
+        computer_ids.append(c)
+        home_ou = random.choice(ou_ids)
+        G.add_node(c, type="Computer", name=c, homeOU=home_ou)
+        G.add_edge(home_ou, c, relation="Contains")   # (B) OU -> Computer
+
+    # 6-8) OU -> GPO (GpLink) : OU당 평균 연결 개수로 샘플링
+    for ou in ou_ids:
+        k = poisson_bounded(AVG_GPOS_PER_OU, MAX_GPOS_PER_OU)
+        for gpo in sample_unique(gpo_ids, k):
+            G.add_edge(ou, gpo, relation="GpLink")
+
+    # 6-9) MemberOf (User -> Group) : 유저당 가입 그룹 수 샘플링
+    for u in user_ids:
+        k = poisson_bounded(AVG_GROUPS_PER_USER, MAX_GROUPS_PER_USER)
+        for g in sample_unique(group_ids, k):
+            G.add_edge(u, g, relation="MemberOf")
+
+    # 6-10) MemberOf (Computer -> Group) : 컴퓨터당 가입 그룹 수 샘플링
+    for c in computer_ids:
+        k = poisson_bounded(AVG_GROUPS_PER_COMPUTER, MAX_GROUPS_PER_COMPUTER)
+        for g in sample_unique(group_ids, k):
+            G.add_edge(c, g, relation="MemberOf")
+
+    # 6-11) Group nesting (Group -> Group) : 그룹당 상위 그룹 수 샘플링
+    for g in group_ids:
+        k = poisson_bounded(AVG_PARENTS_PER_GROUP, MAX_PARENTS_PER_GROUP)
+        parents = sample_unique([x for x in group_ids if x != g], k)
+        for parent in parents:
+            G.add_edge(g, parent, relation="MemberOf")
+
+    # 6-12) AdminTo (User -> Computer) : 유저당 AdminTo 컴퓨터 수 샘플링
+    for u in user_ids:
+        k = poisson_bounded(AVG_ADMINTO_COMPUTERS_PER_USER, MAX_ADMINTO_COMPUTERS_PER_USER)
+        for c in sample_unique(computer_ids, k):
+            G.add_edge(u, c, relation="AdminTo")
+
+    # 6-13) AdminTo (Group -> Computer) : 그룹당 AdminTo 컴퓨터 수 샘플링
+    for g in group_ids:
+        k = poisson_bounded(AVG_ADMINTO_COMPUTERS_PER_GROUP, MAX_ADMINTO_COMPUTERS_PER_GROUP)
+        for c in sample_unique(computer_ids, k):
+            G.add_edge(g, c, relation="AdminTo")
+
+    # 6-14) HasSession (User -> Computer) : 세션 유저 비율 + 유저당 세션 개수 샘플링
+    for u in user_ids:
+        if random.random() < P_USER_HAS_ANY_SESSION:
+            k = poisson_bounded(AVG_SESSIONS_PER_SESSION_USER, MAX_SESSIONS_PER_SESSION_USER)
+            for c in sample_unique(computer_ids, k):
+                G.add_edge(u, c, relation="HasSession")
+
+    # 6-15) WriteOwner (principal -> Group) : 주체당 소수의 그룹에만 권한 부여(희소 유지)
+    principals = user_ids + group_ids
+    for p in principals:
+        k = poisson_bounded(AVG_WRITEOWNER_PER_PRINCIPAL, MAX_WRITEOWNER_PER_PRINCIPAL)
+        targets = sample_unique([g for g in group_ids if g != p], k)
+        for g in targets:
+            G.add_edge(p, g, relation="WriteOwner")
+
+    # 6-16) DCSync 느낌: GetChanges / GetChangesAll (principal -> Domain)
+    for p in principals:
+        if random.random() < P_GETCHANGES:
+            G.add_edge(p, domain, relation="GetChanges")
+        if random.random() < P_GETCHANGESALL:
+            G.add_edge(p, domain, relation="GetChangesAll")
+
+    return G
+
+# ----------------------------
+# 7) 저장 함수: pickle / csv / json / summary
+# ----------------------------
+def save_graph_artifacts(G: nx.DiGraph, out_dir: str) -> None:
+    """그래프를 GA/논문용으로 재현 가능하게 저장"""
+    ensure_dir(out_dir)
+
+    # 7-1) 그래프 저장(pickle)
+    pkl_path = os.path.join(out_dir, "graph.pkl")
+    with open(pkl_path, "wb") as f:
+        pickle.dump(G, f)
+
+    # 7-2) 노드 테이블 저장(node, type)
+    nodes_rows = []
+    for n, attr in G.nodes(data=True):
+        nodes_rows.append({
+            "node": n,
+            "type": attr.get("type", "Unknown")
+        })
+    pd.DataFrame(nodes_rows).to_csv(os.path.join(out_dir, "graph_nodes.csv"), index=False)
+
+    # 7-3) 엣지 테이블 저장(src, dst, relation)
+    edges_rows = []
+    for u, v, attr in G.edges(data=True):
+        edges_rows.append({
+            "src": u,
+            "dst": v,
+            "relation": attr.get("relation", "RelatedTo")
+        })
+    pd.DataFrame(edges_rows).to_csv(os.path.join(out_dir, "graph_edges.csv"), index=False)
+
+    # 7-4) JSON 저장(전체 속성)
+    json_payload = {
+        "nodes": [{"id": n, **attr} for n, attr in G.nodes(data=True)],
+        "edges": [{"src": u, "dst": v, **attr} for u, v, attr in G.edges(data=True)]
+    }
+    with open(os.path.join(out_dir, "graph.json"), "w", encoding="utf-8") as f:
+        json.dump(json_payload, f, ensure_ascii=False, indent=2)
+
+    # 7-5) 요약 저장(|V|,|E|, 타입 분포) #분포 json 데이터
+    node_type_counts = Counter([attr.get("type", "Unknown") for _, attr in G.nodes(data=True)])
+    rel_type_counts = Counter([attr.get("relation", "RelatedTo") for _, _, attr in G.edges(data=True)])
+
+    summary_lines = []
+    summary_lines.append(f"Nodes: {G.number_of_nodes()}")
+    summary_lines.append(f"Edges: {G.number_of_edges()}")
+    summary_lines.append("")
+    summary_lines.append("Node type counts:")
+    for k, v in node_type_counts.most_common():
+        summary_lines.append(f"  {k}: {v}")
+    summary_lines.append("")
+    summary_lines.append("Relation type counts:")
+    for k, v in rel_type_counts.most_common():
+        summary_lines.append(f"  {k}: {v}")
+
+    with open(os.path.join(out_dir, "summary.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(summary_lines))
+
+# ----------------------------
+# 8) 메인: r500/r1000/r2000 생성 + 저장 + 요약 출력
+# ----------------------------
+print("Saving root:", OUTPUT_BASE)
+
+for r in R_LEVELS:
+    print(f"\n=== Generating r{r} (Computers={r}) ===")
+    G = generate_bloodhound_like_graph(r)
+
+    out_dir = os.path.join(OUTPUT_BASE, f"out_r{r}")
+    save_graph_artifacts(G, out_dir)
+
+    node_type_counts = Counter([attr.get("type", "Unknown") for _, attr in G.nodes(data=True)])
+    rel_type_counts = Counter([attr.get("relation", "RelatedTo") for _, _, attr in G.edges(data=True)])
+
+    print("Nodes:", G.number_of_nodes())
+    print("Edges:", G.number_of_edges())
+    print("Top node types:", node_type_counts.most_common(6))
+    print("Top relations :", rel_type_counts.most_common(10))
+    print("Saved to:", out_dir)
+
+print("\n✅ Done. All datasets generated and saved.")
